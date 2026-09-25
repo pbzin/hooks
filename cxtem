@@ -1,0 +1,130 @@
+================================================================================
+GUIA TÉCNICO DE DETECÇÕES, SENSORES E SOLUÇÕES (AOSP & RUNTIME)
+Projeto: crDroid / Caixa Tem & Appdome (Haven)
+================================================================================
+
+[VETOR 1: SONDA NATIVA DE ABSTRACT SOCKET JDWP]
+--------------------------------------------------------------------------------
+- Sensor / O que detecta:
+  A biblioteca nativa (libloader.so) faz uma chamada direta de sistema (syscall 
+  connect) tentando se conectar ao abstract Unix Domain Socket do sistema:
+  `@jdwp-control` (criado pelo daemon adbd quando a depuração USB está ativa).
+- Como o app avalia:
+  * Se conectar com sucesso: Sabe que o adbd está rodando -> Dispara detecção (6906).
+  * Se retornar EACCES (bloqueio puro SELinux): Sabe que o socket existe, mas foi 
+    bloqueado por política -> Dispara detecção (6906) por ambiente adulterado.
+  * Se retornar ECONNREFUSED: Interpreta que a porta está fechada/desligada -> Passa.
+- Limitação do LSPosed:
+  Impossível interceptar de forma estável no Java/libc, pois o app usa syscall 
+  direta em assembly (`svc 0`).
+- Solução Definitiva (ROM - AOSP):
+  Instalar filtro seccomp-BPF durante a especialização do processo no Zygote 
+  (com_android_internal_os_Zygote.cpp) interceptando `socket(AF_UNIX, SOCK_SEQPACKET)`
+  e forçando o kernel a retornar imediatamente `SECCOMP_RET_ERRNO` com `ECONNREFUSED`.
+
+
+[VETOR 2: LEITURA DE PROPRIEDADES DE SISTEMA (BIONIC)]
+--------------------------------------------------------------------------------
+- Sensor / O que detecta:
+  A biblioteca nativa chama as funções da libc `__system_property_get` e 
+  `__system_property_find` para validar o estado real dos serviços de debug.
+  Chaves consultadas:
+  * `init.svc.adbd` (retorna "running" quando o ADB está ligado).
+  * `service.adb.root` (procura se o ADB roda como root).
+  * `debug.ld.app.<pacote>` e `debug.ld.all` (procura flags de debug do linker).
+  * `ro.build.type` (procura builds "userdebug" / "eng").
+  * `ro.build.tags` (procura builds com "test-keys").
+- Como o app avalia:
+  Se `init.svc.adbd` retornar "running", a mesma thread monta o código 6906 
+  e despacha a decisão fatal.
+- Solução no Módulo (Diagnóstico):
+  Hook via Dobby/C++ em `__system_property_get` e `__system_property_find`.
+- Solução Definitiva (ROM - AOSP):
+  Implementar a virtualização nativa no Bionic (`bionic/libc/bionic/custom_rom_hide.cpp`),
+  forçando para processos sob Sandbox:
+  * `init.svc.adbd` -> Retorna "stopped" e `__system_property_find` retorna `nullptr`.
+  * `service.adb.root` e `debug.ld.*` -> Retorna 0 (vazio).
+  * `ro.build.type` -> Retorna "user".
+  * `ro.build.tags` -> Retorna "release-keys".
+
+
+[VETOR 3: PONTE JNI E THREAD TRABALHADORA DE SCAN]
+--------------------------------------------------------------------------------
+- Sensor / O que detecta:
+  O app cria uma thread secundária dedicada exclusivamente para rodar a checagem:
+  `fzJF72.keHEH3.sRLmp2.p60Bg8$2.run()`
+  Essa thread executa a ponte JNI:
+  `fzJF72.keHEH3.sRLmp2.rh5en1.mjxhS9(Native Method)`
+  Dentro desse método nativo, os sensores são lidos e o resultado é entregue 
+  ao método Java `p60Bg8.e2wWf9(...)` com o código `6906` e `arg2 = true`.
+- Solução (Módulo / Runtime):
+  * Suprimir a execução de `p60Bg8$2.run()` (setResult(null)).
+  * Fazer `rh5en1.mjxhS9()` retornar void imediatamente sem executar o scanner nativo.
+  * Mutação no método Java `e2wWf9`: forçar `arg2 = false` e suprimir mensagens 
+    de erro visuais.
+
+
+[VETOR 4: ROTINAS NATIVAS DE AUTO-EXTERMÍNIO (SUICÍDIO DO PROCESSO)]
+--------------------------------------------------------------------------------
+- Mecanismo / Como funciona:
+  Quando a biblioteca nativa identifica qualquer inconsistência, ela não apenas 
+  avisa o Java, mas tenta matar o próprio processo por múltiplos caminhos:
+  1. `android.os.Process.killProcess()` e `sendSignal(9)` (via Java).
+  2. `_exit(0)` executado por subprocessos e threads no offset nativo `0x1d2970`.
+  3. `kill(0)` executado no offset nativo `0x1ff2c4`.
+  4. Syscall direta no processador para `SYS_exit_group` (quando a libc falha).
+- Ponto de Atenção Crítico:
+  Bloquear `_exit` com `pthread_exit` ou loops infinitos corrompe o runtime e 
+  causa ANR/Watchdog do ActivityManager (gera tela preta e reinício a cada 14s).
+  Forçar o retorno direto de `_exit` no offset `0x1d2970` bate no `__stack_chk_fail`.
+- Solução (Módulo / Runtime):
+  * Bloquear `kill`/`tgkill` retornando 0 (sucesso simulado).
+  * No `_exit`, redirecionar a execução do offset `0x1d2970` para o epílogo seguro 
+    da função (`0x1d28a8`).
+
+
+[VETOR 5: ERRO DA GOOGLE PLAY CORE (IN-APP UPDATES)]
+--------------------------------------------------------------------------------
+- Sensor / O que detecta:
+  O app chama a biblioteca Play Core na inicialização para checar se há updates 
+  obrigatórios. A chamada bate no Binder da Play Store (`com.android.vending`).
+  Como a ROM não tem certificação oficial ou atestado Play Integrity completo, 
+  a API retorna o erro:
+  `Install Error(-3): ERROR_API_NOT_AVAILABLE`
+- Como o app avalia:
+  O erro é repassado para `br.gov.caixa.tem.comunica.backend.j.onFailure(Exception)`.
+  O `onFailure` dispara o fechamento imediato da tela inicial.
+- Solução (Módulo / Runtime):
+  No hook de `comunica.backend.j.onFailure`: se a exceção for do tipo `kw.a` ou 
+  contiver `Install Error(-3)`, suprimir a execução para que o app ignore a falha 
+  e considere que a verificação passou.
+
+
+[VETOR 6: LOOPBACK LOCAL E HANDSHAKE TLS (CONSCRYPT)]
+--------------------------------------------------------------------------------
+- Mecanismo / Como funciona:
+  O motor de proteção sobe um servidor TLS local em `127.0.0.1` (portas efêmeras)
+  através de `fzJF72.fHNpz7.fTStr6.mhw734` usando Conscrypt. Todo o tráfego 
+  interno de validação passa por esse túnel.
+- Erro Identificado:
+  `javax.net.ssl.SSLHandshakeException: Trust anchor for certification path not found.`
+  Ocorre porque o certificado local autoassinado gerado pelo SDK não possui raiz 
+  de confiança nas CAs padrão do Android.
+- Consequência:
+  Ao falhar o handshake TLS, o callback `pw.g.run` aborta a inicialização e chama 
+  `SplashScreenAnimation.P0() -> U0() -> finish()`.
+- Solução (Módulo / Runtime):
+  * Bloquear as rotinas de destruição `P0()` e `U0()` quando acionadas por `pw.g`.
+  * Bloquear o `finish()` da SplashScreen até que a `TelaInicialActivity` esteja 
+    completamente desenhada (`onResume`).
+
+================================================================================
+RESUMO DA ARQUITETURA DEFINITIVA NA ROM (AOSP)
+================================================================================
+1. Zygote (Kernel-Level):
+   Filtro seccomp para `@jdwp-control` -> Devolve ECONNREFUSED nativo.
+2. Bionic (Libc-Level):
+   Virtualização de `init.svc.adbd=stopped` e limpeza de `debug.ld.*` e `service.adb.root`.
+3. Sepolicy:
+   Isolamento de privilégios mantendo coerência com regras de release-keys e user build.
+================================================================================
