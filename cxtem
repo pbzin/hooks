@@ -118,81 +118,77 @@ Projeto: crDroid / Caixa Tem & Appdome (Haven)
   * Bloquear o `finish()` da SplashScreen até que a `TelaInicialActivity` esteja 
     completamente desenhada (`onResume`).
 
-================================================================================
-RESUMO DA ARQUITETURA DEFINITIVA NA ROM (AOSP)
-================================================================================
-1. Zygote (Kernel-Level):
-   Filtro seccomp para `@jdwp-control` -> Devolve ECONNREFUSED nativo.
-2. Bionic (Libc-Level):
-   Virtualização de `init.svc.adbd=stopped` e limpeza de `debug.ld.*` e `service.adb.root`.
-3. Sepolicy:
-   Isolamento de privilégios mantendo coerência com regras de release-keys e user build.
-================================================================================
 
-
-================================================================================
-[CASO DE SUCESSO: ISOLAMENTO DEFINITIVO DO JDWP/ADB NA ROM CRDROID]
-================================================================================
-
-1. O PROBLEMA / DETECÇÃO RAIZ (ERRO 6906):
+[VETOR 7: SONDA DE SOCKET NO SISTEMA DE ARQUIVOS (/dev/socket/adbd)]
 --------------------------------------------------------------------------------
-- O aplicativo utiliza uma biblioteca nativa (libloader.so / motor Haven/Appdome)
-  que detecta a presença do daemon do ADB (adbd) ativo no sistema operacional.
-- Método de sondagem: Syscall direta em assembly (`svc 0`) tentando se conectar
-  ao abstract unix domain socket do sistema: `@jdwp-control`.
-- Por que hooks de userspace (libc/LSPosed) falham:
-  A syscall direta pula completamente a libc.so e o framework Java, indo direto
-  para a tabela de interrupções do Kernel Linux.
-- Por que a negação pura via SELinux falhou:
-  O SELinux retorna `EACCES` (Permission Denied). Quando o serviço está desligado
-  de verdade, o Kernel retorna `ECONNREFUSED` (Connection Refused). O aplicativo
-  distingue esses códigos e interpreta o `EACCES` como bloqueio de ambiente adulterado.
+- Sensor / O que detecta:
+  Além do abstract socket na RAM (`@jdwp-control`), a biblioteca nativa tenta se
+  conectar diretamente ao socket Unix físico do daemon no sistema de arquivos:
+  `/dev/socket/adbd`.
+- Como o app avalia:
+  Com a depuração ativa, o socket físico existe no sistema de arquivos. Ao tentar
+  conectar, o SELinux devolve `EACCES` (Permissão Negada). O app identifica que
+  o nó existe e confirma que o daemon adbd está em execução -> Dispara 6906.
+- Solução Definitiva (ROM - AOSP):
+  O Zygote aplica um `bind mount` de `/dev/null` sobre `/dev/socket/adbd`
+  especificamente dentro do Mount Namespace privado do processo em Sandbox.
+  A tentativa de conexão bate em um nó nulo e recebe `ECONNREFUSED` legítimo,
+  equivalente ao adbd indisponível.
+
+
+================================================================================
+[ARQUITETURA DEFINITIVA CONSOLIDADA NA ROM CRDROID]
+================================================================================
+
+1. DIAGNÓSTICO DOS DOIS SENSORES INDEPENDENTES:
+--------------------------------------------------------------------------------
+O aplicativo utiliza DOIS detectores nativos paralelos para atestar o ADB ativo:
+  1. O abstract socket JDWP na memória RAM: `@jdwp-control`
+  2. O socket Unix no filesystem: `/dev/socket/adbd`
+Se apenas um deles for mitigado, o outro continua disparando a detecção 6906.
+Ambos precisam ser neutralizados simultaneamente com retorno `ECONNREFUSED`.
 
 2. O TESTE DE CONTROLE DECISIVO (PROVA DOS NOVE):
 --------------------------------------------------------------------------------
 - Comando executado no terminal do dispositivo:
-  `su -c 'stop adbd'`
+  `adb shell su -c 'stop adbd'`
 - Resultado: O aplicativo abriu imediatamente com 100% de estabilidade, sem erros
   e sem crash, mesmo com a chave `adb_enabled=1` mantida nas configurações.
 - Conclusão Científica: O gatilho de detecção não residia em propriedades Java, 
-  nem no USB ou Google Play Services, mas estritamente na presença do processo 
-  `adbd` escutando no socket `@jdwp-control`.
+  nem no USB ou Google Play Services, mas estritamente na presença ativa do 
+  daemon `adbd` respondendo nesses dois sockets.
 
-3. A FALHA DA PRIMEIRA IMPLEMENTAÇÃO DE SECCOMP:
+3. IMPLEMENTAÇÃO FINAL CONJUNTA NO AOSP:
 --------------------------------------------------------------------------------
-- A primeira tentativa de seccomp interceptou a criação de sockets em `socket()`.
-- Falha arquitetural: Pelo padrão POSIX/Linux, a chamada de sistema `socket()`
-  nunca retorna `ECONNREFUSED` (111). A biblioteca nativa identificava a anomalia
-  sintética na criação do socket e disparava a auto-finalização do processo.
-
-4. A SOLUÇÃO DEFINITIVA IMPLEMENTADA NA ROM (PATCH 0130):
---------------------------------------------------------------------------------
-A intervenção foi aplicada diretamente no ciclo de especialização do Zygote
-e nos serviços do sistema (AOSP):
+A intervenção foi aplicada diretamente no ciclo de especialização do Zygote,
+no Bionic libc e nos serviços do sistema:
 
 A) Barreira Seccomp-BPF Estreita no Kernel (libandroid_runtime.so):
    - Arquivo: `frameworks/base/core/jni/com_android_internal_os_Zygote.cpp`
-   - Aplica um filtro de seccomp cirúrgico antes do processo do app perder privilégios.
-   - Intercepta estritamente: `AF_UNIX + SOCK_SEQPACKET` (assinatura exclusiva do 
-     protocolo JDWP do Android Runtime/adbd).
+   - Intercepta chamadas `socket(AF_UNIX, SOCK_SEQPACKET)` (JDWP).
    - Retorno forçado pelo Kernel: `SECCOMP_RET_ERRNO` com valor `111` (ECONNREFUSED).
    - Preservação: Libera integralmente `SOCK_STREAM`, `SOCK_DGRAM`, TCP e UDP, 
      garantindo que conectividade, rede, IPC padrão e WebViews funcionem perfeitamente.
 
-B) Tratamento no Cliente do ADB (adbconnection_client.cpp):
-   - Trata o retorno nativo de `ECONNREFUSED` como endpoint JDWP legítimamente 
-     indisponível (como se o adbd estivesse desligado), sem gerar crashes no runtime.
+B) Mascaramento de Mount Namespace (/dev/socket/adbd):
+   - No Zygote, antes do rebaixamento de privilégios (drop de UID), aplica
+     `mount --bind /dev/null /dev/socket/adbd` dentro do namespace do processo.
+   - Qualquer tentativa de conexão ao socket físico resulta em `ECONNREFUSED`.
 
-C) Gestão de Ciclo de Vida e Decisão de Política (services.jar):
-   - Arquivo: `frameworks/base/services/core/java/com/android/server/am/ProcessList.java`
-   - Garante que a flag de Sandbox e o filtro de kernel sejam transmitidos do
-     `system_server` para o Zygote na criação do processo do app alvo.
+C) Virtualização de Propriedades no Bionic (custom_rom_hide.cpp):
+   - `init.svc.adbd` retorna "stopped" e `__system_property_find` retorna `nullptr`.
+   - `service.adb.root` e `debug.ld.*` são zerados para processos sob Sandbox.
+   - `ro.build.type=user` e `ro.build.tags=release-keys` são garantidos.
 
-5. RESULTADO FINAL OBTIDO:
+D) Virtualização no Framework (Settings.java & SettingsProvider.java):
+   - Intercepta `development_settings_enabled` e `adb_enabled`, retornando `"0"`
+     no cliente (`NameValueCache`) antes de consultar o cache ou o banco de dados.
+
+4. RESULTADO FINAL OBTIDO:
 --------------------------------------------------------------------------------
 - O daemon `adbd` permanece 100% ativo e funcional no aparelho para comandos via PC.
 - O computador mantém controle total via cabo USB (`adb shell`, depuração, etc.).
-- O processo do aplicativo recebe `ECONNREFUSED` legítimo do Kernel ao sondar o socket.
+- Os dois sensores nativos (`@jdwp-control` e `/dev/socket/adbd`) recebem `ECONNREFUSED`.
 - O aplicativo abre direto na tela de login, liso, sem erro 6906, sem avisos de 
   depuração e sem dependência de nenhum módulo Xposed/LSPosed ou injeção de memória.
 - Solução 100% nativa do sistema operacional (ROM crDroid).
